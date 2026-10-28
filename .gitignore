@@ -1,0 +1,4 @@
+build/
+dist/
+*.asi
+*.log
