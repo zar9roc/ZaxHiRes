@@ -17,13 +17,15 @@ Runs the game at any resolution your display offers (tested at 1280×800 and 192
 
 ## Requirements
 
-- `Zax.exe` build 2001-08-02 (PE timestamp `0x3b68d52c`; tested exe SHA-256 `7d9efcae1ef09975b0826e7c5d164d97a490bda5fa826ddf906e2e4acea236e4`). On any other exe the plugin patches nothing and says so in `ZaxHiRes.log`.
+- One of these `Zax.exe` builds (on any other exe the plugin patches nothing and says so in `ZaxHiRes.log`):
+  - 2001-08-02 (PE timestamp `0x3b68d52c`; tested exe SHA-256 `7d9efcae1ef09975b0826e7c5d164d97a490bda5fa826ddf906e2e4acea236e4`)
+  - 2001-10-24, the Polish JoWooD release (PE timestamp `0x3bd755b6`; SHA-256 `a3ec536518d8551333f868eaa98e5e3c4432e26e48940abf6c044341508809f9`)
 - [DxWrapper](https://github.com/elishacloud/dxwrapper) with `LoadPlugins = 1` and `Dd7to9 = 1` (the release zip includes version 1.0.6334.21, configured).
 - Windows, or Linux / Steam Deck with Wine or Proton (launch option `WINEDLLOVERRIDES="ddraw=n,b" %command%`). Tested on Steam Deck with Proton.
 
 ## Usage
 
-Pick the resolution in the game's Options menu, or pass `/ScreenWidth W /ScreenHeight H` on the command line. A choice made in the menu is stored in `Zax.CFG` (`[ZaxHiRes]`) and wins over the command line; delete that section to go back.
+Pick the resolution in the game's Options menu, or pass `/ScreenWidth W /ScreenHeight H` on the command line. A choice made in the menu is stored in `Zax.CFG` (`[ZaxHiRes]`) and wins over the command line; delete that section to go back. ZaxHiRes writes nothing else: the game's own `[Options]` settings are left as they were, so removing the patch gives back the game exactly as it was.
 
 Diagnostic switches (command line): `/LogFps`, `/LogSleep`, `/LogHud`, `/CamProbe`, `/CompStats`, `/CompVerify`. Experimental: `/FastCopy`, `/CompC`, `/CompAvx2` (no measurable gain since the tile cache fix), `/NoPoolFix` (original tile cache size, for comparison).
 

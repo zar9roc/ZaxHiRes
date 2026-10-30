@@ -1,6 +1,8 @@
 /*
  * ZaxHiRes.asi - custom resolution support for Zax: The Alien Hunter
- * (Zax.exe, PE timestamp 2001-08-02, image base 0x400000).
+ * (Zax.exe, PE timestamp 2001-08-02 or the Polish 2001-10-24 build, image
+ * base 0x400000). Addresses in this file are those of the 2001-08-02 build;
+ * see builds[] for the other.
  *
  * Loaded by DxWrapper (LoadPlugins = 1) before the game's entry point runs.
  * Reads the requested resolution: one chosen in the game's Options menu
@@ -35,7 +37,40 @@
 
 #define MAX_PATCHES   48
 #define MAX_PARENTS   64
-#define ZAX_TIMESTAMP 0x3b68d52c
+
+/*
+ * Supported Zax.exe builds, by PE timestamp. The Polish 2001-10-24 build
+ * (JoWooD) has the same data, imports and code below 0x59e856; there a HUD
+ * check is inserted (15 bytes: skip the HUD when 0x4f1050 says so) and one
+ * more padding byte before 0x59fc70, so code above moves by +0xf, then
+ * +0x10 (up to 0x5d0514, past every patch site). All callees, resume and
+ * return addresses the hooks use are below 0x59e856.
+ */
+typedef struct { DWORD from, delta; } Shift;
+typedef struct {
+    DWORD timestamp;
+    const char *name;
+    const Shift *shifts;
+    int nshifts;
+} Build;
+
+static const Shift polish_shifts[] = { { 0x59e856, 0xf }, { 0x59fc70, 0x10 } };
+static const Build builds[] = {
+    { 0x3b68d52c, "2001-08-02", NULL, 0 },
+    { 0x3bd755b6, "2001-10-24 (Polish)", polish_shifts, 2 },
+};
+static const Build *build;
+
+/* A 2001-08-02 code address in the running build. */
+static DWORD reloc(DWORD va)
+{
+    DWORD delta = 0;
+    int i;
+    for (i = 0; i < build->nshifts; i++)
+        if (va >= build->shifts[i].from)
+            delta = build->shifts[i].delta;
+    return va + delta;
+}
 
 typedef struct {
     DWORD va;
@@ -53,6 +88,12 @@ static char exedir[MAX_PATH];
 /* Menu centring offset, read by the mode 5 hook. */
 int center_dx __asm__("zh_center_dx");
 int center_dy __asm__("zh_center_dy");
+/* Materials generator (shop) position offset, see gen_paint_hook. */
+int gen_dx __asm__("zh_gen_dx");
+int gen_dy __asm__("zh_gen_dy");
+/* Offset for the child being placed, set by should_center(). */
+int mode5_dx __asm__("zh_mode5_dx");
+int mode5_dy __asm__("zh_mode5_dy");
 DWORD mode5_resume __asm__("zh_mode5_resume") = 0x40df6b;
 
 /* Parent window classes (vtables) seen by the hook, logged once each. */
@@ -92,7 +133,8 @@ static void logmsg(const char *fmt, ...)
     WriteFile(logfile, buf, n, &n, NULL);
 }
 
-static void add(DWORD va, const BYTE *orig, const BYTE *repl, int len, const char *what)
+/* va is already relocated. */
+static void put(DWORD va, const BYTE *orig, const BYTE *repl, int len, const char *what)
 {
     Patch *p = &patches[npatches++];
     p->va = va;
@@ -100,6 +142,19 @@ static void add(DWORD va, const BYTE *orig, const BYTE *repl, int len, const cha
     copy(p->repl, repl, len);
     p->len = len;
     p->what = what;
+}
+
+static void add(DWORD va, const BYTE *orig, const BYTE *repl, int len, const char *what)
+{
+    put(reloc(va), orig, repl, len, what);
+}
+
+/* Bytes of a call at va (relocated) to callee (2001-08-02 address). */
+static void call_bytes(BYTE o[5], DWORD va, DWORD callee)
+{
+    DWORD rel = reloc(callee) - (va + 5);
+    o[0] = 0xe8;
+    copy(o + 1, &rel, 4);
 }
 
 /* Replace the trailing imm32 of an instruction (opcode bytes + imm32). */
@@ -128,44 +183,48 @@ static void add_nops(DWORD va, const BYTE *orig, int len, const char *what)
  * add their children before they are resized (main menu is 677x11 then), and
  * dialogs are top-level too but already centred by the game.
  */
-static const DWORD centered_screens[] = {
-    0x6055d4,   /* main menu (constructor 0x5be4a0) */
+static const struct { DWORD vtable; const int *dx, *dy; } centered_screens[] = {
+    { 0x6055d4, &center_dx, &center_dy },   /* main menu (constructor 0x5be4a0) */
+    /* Materials generator (shop, ctor 0x504050): its widgets, designed for
+       its 800x416 art at the top-left of the screen; moved with the art */
+    { 0x5f9ccc, &gen_dx, &gen_dy },
 };
 
 /*
  * Window objects keep their vtable at +0x00, rect at +0x04 (left, top,
  * right, bottom) and parent pointer at +0xe8. Called from the mode 5 hook
- * for every child placed that way; returns non-zero if the child's offsets
- * should get the centring offset.
+ * for every child placed that way; sets mode5_dx / mode5_dy to the offset
+ * the child gets (0, 0 if none).
  */
-int should_center(const DWORD *parent) __asm__("zh_should_center");
-int should_center(const DWORD *parent)
+void should_center(const DWORD *parent) __asm__("zh_should_center");
+void should_center(const DWORD *parent)
 {
     int left = parent[1], top = parent[2];
     int w = parent[3] - left, h = parent[4] - top;
-    int center = 0;
     int i;
 
+    mode5_dx = mode5_dy = 0;
     for (i = 0; i < (int)(sizeof centered_screens / sizeof centered_screens[0]); i++)
-        if (parent[0] == centered_screens[i])
-            center = 1;
+        if (parent[0] == centered_screens[i].vtable) {
+            mode5_dx = *centered_screens[i].dx;
+            mode5_dy = *centered_screens[i].dy;
+        }
 
     for (i = 0; i < nseen; i++)
         if (seen_parents[i] == parent[0])
-            return center;
+            return;
     if (nseen < MAX_PARENTS) {
         seen_parents[nseen++] = parent[0];
-        logmsg("mode 5 parent: vtable 0x%06lx  rect %d,%d %dx%d  parent 0x%08lx  -> %s",
-               parent[0], left, top, w, h, parent[0x3a], center ? "centred" : "unchanged");
+        logmsg("mode 5 parent: vtable 0x%06lx  rect %d,%d %dx%d  parent 0x%08lx  -> offset %d,%d",
+               parent[0], left, top, w, h, parent[0x3a], mode5_dx, mode5_dy);
     }
-    return center;
 }
 
 /*
  * Replaces 0x40df61..0x40df6a in layout mode 5 (0x40df53), where
  *   ebx = parent y origin, eax at entry; ebp = y offset; edi = x offset.
- * Re-executes the overwritten instructions, then adds the centring offset to
- * the child's x/y offsets when should_center() says so.
+ * Re-executes the overwritten instructions, then adds the offset
+ * should_center() chose to the child's x and y offsets.
  */
 __attribute__((naked)) static void mode5_hook(void)
 {
@@ -180,25 +239,24 @@ __attribute__((naked)) static void mode5_hook(void)
         "addl $4, %esp\n\t"
         "popl %edx\n\t"
         "popl %ecx\n\t"
-        "testl %eax, %eax\n\t"
-        "jz 1f\n\t"
-        "addl zh_center_dy, %ebx\n\t"
-        "addl zh_center_dx, %edi\n\t"
-        "1:\n\t"
+        "addl zh_mode5_dx, %edi\n\t"
+        "addl zh_mode5_dy, %ebx\n\t"
         "jmp *zh_mode5_resume\n\t");
 }
 
 static void add_jmp(DWORD va, const BYTE *orig, int len, void *target, const char *what)
 {
     BYTE r[16];
-    DWORD rel = (DWORD)target - (va + 5);
+    DWORD rel;
     int i;
 
+    va = reloc(va);
+    rel = (DWORD)target - (va + 5);
     r[0] = 0xe9;
     copy(r + 1, &rel, 4);
     for (i = 5; i < len; i++)
         r[i] = 0x90;
-    add(va, orig, r, len, what);
+    put(va, orig, r, len, what);
 }
 
 static const BYTE OP_PUSH[]    = { 0x68 };
@@ -220,6 +278,7 @@ static const BYTE OP_MOV_EBX[] = { 0xbb };
 typedef void (__attribute__((thiscall)) *Blit4Fn)(void *dst, void *src, int x, int y, int flags);
 int hud_dx __asm__("zh_hud_dx");
 int hud_half_dx __asm__("zh_hud_half_dx");
+static int hud_bar_y, hud_bar_drawn;   /* this frame's bar top, for gen_dim */
 
 void __attribute__((thiscall)) hud_filler(void *dst, void *src, int x, int y, int flags) __asm__("zh_hud_filler");
 void __attribute__((thiscall)) hud_filler(void *dst, void *src, int x, int y, int flags)
@@ -230,6 +289,8 @@ void __attribute__((thiscall)) hud_filler(void *dst, void *src, int x, int y, in
 
     ((void (__attribute__((thiscall)) *)(void *, RECT *))(*(DWORD **)src)[0x90 / 4])(src, &r);
     fw = r.right - r.left;
+    hud_bar_y = y;
+    hud_bar_drawn = 1;
     if (fw <= 0)
         return;
     for (px = x; px < end; px += fw)
@@ -247,13 +308,18 @@ __attribute__((naked)) static void hud_filler_hook(void)
         "jmp zh_hud_filler\n\t");
 }
 
-static void add_call(DWORD va, const BYTE *orig, void *target, const char *what)
+/* Redirects the call at va to callee to target instead. */
+static void add_call(DWORD va, DWORD callee, void *target, const char *what)
 {
-    BYTE r[5];
-    DWORD rel = (DWORD)target - (va + 5);
+    BYTE o[5], r[5];
+    DWORD rel;
+
+    va = reloc(va);
+    call_bytes(o, va, callee);
+    rel = (DWORD)target - (va + 5);
     r[0] = 0xe8;
     copy(r + 1, &rel, 4);
-    add(va, orig, r, 5, what);
+    put(va, o, r, 5, what);
 }
 
 /*
@@ -261,13 +327,15 @@ static void add_call(DWORD va, const BYTE *orig, void *target, const char *what)
  * art 800 wide with an 80-px rock margin on each side. It slides up from the
  * bottom; 0x4295be moves it to x = -80 on 640-wide screens (hiding the
  * margins) and x = 0 otherwise. At higher resolutions nothing is drawn beside
- * it. inv_move centres it; inv_fill (just before the finished frame is
- * presented, 0x4f3124) repeats its rock margins out to the screen edges.
+ * it. inv_move centres it; inv_cursor repeats its rock margins out to the
+ * screen edges once the windows are painted, just before the mouse cursor is
+ * drawn (0x4f2d03), so the cursor isn't copied along or painted over.
  */
 #define INV_MARGIN 80
 static const DWORD *surf_rows(const void *surf);
 static BYTE *surf_base(const void *surf);
 typedef void (__attribute__((thiscall)) *MoveToFn)(void *win, int x, int y);
+typedef void (__attribute__((thiscall)) *CursorDrawFn)(void *cursor, void *dst);
 static DWORD *inv_window;
 static int inv_screen_w, inv_screen_h;
 
@@ -294,21 +362,131 @@ static void inv_fill_row(WORD *row, int x0, int x1)
             row[dx + i] = row[x1 - INV_MARGIN + i];
 }
 
-void __attribute__((thiscall)) inv_present(void *dst, void *src, int x, int y, int flags) __asm__("zh_inv_present");
-void __attribute__((thiscall)) inv_present(void *dst, void *src, int x, int y, int flags)
+/* Replaces the cursor draw 0x518760 (thiscall cursor, dst = the frame). */
+static void __attribute__((thiscall)) inv_cursor(void *cursor, void *dst)
 {
     const DWORD *win = inv_window;
 
     if (win && (int)win[2] < inv_screen_h && (int)win[1] >= INV_MARGIN &&
         (int)win[3] <= inv_screen_w - INV_MARGIN && (int)(win[3] - win[1]) >= 2 * INV_MARGIN) {
-        const DWORD *rows = surf_rows(src);
-        BYTE *base = surf_base(src);
+        const DWORD *rows = surf_rows(dst);
+        BYTE *base = surf_base(dst);
         int yy, top = (int)win[2] < 0 ? 0 : (int)win[2];
         if (rows && base)
             for (yy = top; yy < inv_screen_h; yy++)
                 inv_fill_row((WORD *)(base + rows[yy] * 2), (int)win[1], (int)win[3]);
     }
-    ((Blit4Fn)0x4b3280)(dst, src, x, y, flags);
+    ((CursorDrawFn)0x518760)(cursor, dst);
+}
+
+/*
+ * Materials generator (shop): its paint method 0x505990 blits the 800x416
+ * background art (frame and the table grid) at a fixed (0, 0) of the screen;
+ * its widgets are mode 5 children, moved by the same offset in the mode 5
+ * hook. Replaces 0x5059b6 (push 0 = y; push 0 = x; jne): the art goes to
+ * (gen_dx, gen_dy), centred across, its bottom on the HUD bar's top with the
+ * inventory open, right above the inventory panel (also 800 wide with its
+ * rock margins). Both branches of the jne (dst width 640 or not) do the same
+ * blit; patched only above 800x600, so always the general one.
+ *
+ * While it is open, gen_dim darkens the frame to half brightness, like a
+ * modal dialog: after the world and the HUD bar are drawn, before the
+ * windows (inventory, the shop) paint into the frame in z-order (root window
+ * paint, game vtable +0x4c at 0x4f2cc1), and before the cursor. Rows from the
+ * HUD bar's top down are left alone.
+ */
+#define GEN_W         800       /* background art size */
+#define GEN_H         416
+#define HUD_OPEN_TOP  186       /* HUD bar top, inventory open: H - 186 */
+#define GAME_OBJ  0x713f14      /* [GAME_OBJ] = game; +0x2a8 = frame surface */
+#define GENERATOR 0x6c2cfc      /* the open materials generator, else 0 */
+typedef int (__attribute__((thiscall)) *SurfDimFn)(const void *surf);
+DWORD gen_paint_resume __asm__("zh_gen_paint_resume") = 0x5059d7;
+static int frame_is_555(void);
+
+void gen_dim(const DWORD *game) __asm__("zh_gen_dim");
+void gen_dim(const DWORD *game)
+{
+    const BYTE *gen = *(const BYTE **)GENERATOR;
+    void *dst = (void *)game[0x2a8 / 4];
+    DWORD mask, x, y, w, h;
+    const DWORD *rows;
+    BYTE *base;
+    int bar = hud_bar_drawn ? hud_bar_y : -1;
+
+    hud_bar_drawn = 0;
+    if (!gen || gen[0x13d] || !dst)     /* +0x13d: closing */
+        return;
+    /* per pixel: p >> 1 for each channel, the mask drops the bit shifted in
+       from the next channel; two pixels per dword */
+    mask = frame_is_555() ? 0x3def3def : 0x7bef7bef;
+    w = ((SurfDimFn)(*(DWORD **)dst)[0xb4 / 4])(dst);
+    h = ((SurfDimFn)(*(DWORD **)dst)[0x9c / 4])(dst);
+    if (bar >= 0 && (DWORD)bar < h)
+        h = bar;
+    rows = surf_rows(dst);
+    base = surf_base(dst);
+    if (!rows || !base)
+        return;
+    for (y = 0; y < h; y++) {
+        BYTE *row = base + rows[y] * 2;
+        for (x = 0; x + 2 <= w; x += 2) {
+            DWORD p = *(DWORD *)(row + x * 2);
+            *(DWORD *)(row + x * 2) = (p >> 1) & mask;
+        }
+        if (x < w) {
+            WORD p = *(WORD *)(row + x * 2);
+            *(WORD *)(row + x * 2) = (WORD)((p >> 1) & mask);
+        }
+    }
+}
+
+/* Logs the generator's window, paint target and art once. */
+typedef void (__attribute__((thiscall)) *GetRectFn2)(const void *surf, RECT *r);
+void gen_paint_log(const DWORD *gen, const void *dst) __asm__("zh_gen_paint_log");
+void gen_paint_log(const DWORD *gen, const void *dst)
+{
+    static int logged;
+    const void *art = (const void *)gen[0x100 / 4];
+    RECT r = { 0, 0, 0, 0 };
+
+    if (logged++)
+        return;
+    if (art)
+        ((GetRectFn2)(*(DWORD **)art)[0x90 / 4])(art, &r);
+    logmsg("materials generator: window %ld,%ld-%ld,%ld, paints to %08lx (%dx%d), art %ldx%ld at %d,%d",
+           gen[1], gen[2], gen[3], gen[4], (DWORD)dst,
+           ((SurfDimFn)(*(DWORD **)dst)[0xb4 / 4])(dst), ((SurfDimFn)(*(DWORD **)dst)[0x9c / 4])(dst),
+           r.right - r.left, r.bottom - r.top, gen_dx, gen_dy);
+}
+
+__attribute__((naked)) static void gen_paint_hook(void)
+{
+    __asm__ volatile(
+        "pushal\n\t"
+        "pushl %edi\n\t"                /* dst */
+        "pushl %esi\n\t"                /* generator */
+        "call zh_gen_paint_log\n\t"
+        "addl $8, %esp\n\t"
+        "popal\n\t"
+        "pushl zh_gen_dy\n\t"           /* y, was 0 */
+        "pushl zh_gen_dx\n\t"           /* x, was 0 */
+        "jmp *zh_gen_paint_resume\n\t");
+}
+
+/* Called instead of 0x4f2cbd (mov eax,[edi]; mov ecx,edi; call [eax+0x4c]),
+   edi = game: dim, then the window paint. */
+__attribute__((naked)) static void gui_paint_hook(void)
+{
+    __asm__ volatile(
+        "pushal\n\t"
+        "pushl %edi\n\t"
+        "call zh_gen_dim\n\t"
+        "addl $4, %esp\n\t"
+        "popal\n\t"
+        "movl (%edi), %eax\n\t"         /* original */
+        "movl %edi, %ecx\n\t"
+        "jmp *0x4c(%eax)\n\t");
 }
 
 static int cmdline_has(const char *cmdline, const char *name);
@@ -352,24 +530,32 @@ static void build_patches(DWORD w, DWORD h)
     /* HUD bar: offsets for the real width, filler repeated across the gap. */
     hud_dx = w - 640;
     hud_half_dx = (w - 640) / 2;
-    add_call(0x59ed7a, (const BYTE[]){ 0xe8, 0x01, 0x45, 0xf1, 0xff }, hud_filler_hook,
-             "HUD: offsets for the real width, filler across the gap");
+    add_call(0x59ed7a, 0x4b3280, hud_filler_hook, "HUD: offsets for the real width, filler across the gap");
     add_imm32(0x59fc2c, (const BYTE[]){ 0xc7, 0x45, 0xe0 }, 3, (DWORD)-0x50, (DWORD)-hud_half_dx,
               "HUD: left-side inventory renderer offset");
 
     /* Inventory screen: centred, rock margins repeated to the screen edges. */
     inv_screen_w = w;
     inv_screen_h = h;
-    add_call(0x4295be, (const BYTE[]){ 0xe8, 0x6d, 0x40, 0xfe, 0xff }, (void *)inv_move,
-             "inventory: centre horizontally");
-    add_call(0x4f3124, (const BYTE[]){ 0xe8, 0x57, 0x01, 0xfc, 0xff }, (void *)inv_present,
-             "inventory: rock margins to the screen edges");
+    add_call(0x4295be, 0x40d630, (void *)inv_move, "inventory: centre horizontally");
+    add_call(0x4f2d03, 0x518760, (void *)inv_cursor, "inventory: rock margins to the screen edges");
 
     /* Menu centring: Background switches from mode 5 to mode 6 (centre in
        parent), everything else placed with mode 5 goes through the hook. */
     add(0x5be66a, (const BYTE[]){ 0x6a, 0x05 }, (const BYTE[]){ 0x6a, 0x06 }, 2, "Background: layout mode 5 -> 6");
     add_jmp(0x40df61, (const BYTE[]){ 0x8b, 0x8e, 0xe8, 0x00, 0x00, 0x00, 0x8b, 0xd8, 0x03, 0xdd }, 10,
             mode5_hook, "layout mode 5: centring hook");
+
+    /* Materials generator: background art follows its centred widgets. */
+    add_jmp(0x5059b6, (const BYTE[]){ 0x6a, 0x00, 0x6a, 0x00, 0x75, 0x1b }, 6,
+            gen_paint_hook, "materials generator: background art centred");
+    {   /* and the game behind it dimmed */
+        BYTE r[7] = { 0xe8, 0, 0, 0, 0, 0x90, 0x90 };
+        DWORD rel = (DWORD)gui_paint_hook - (reloc(0x4f2cbd) + 5);
+        copy(r + 1, &rel, 4);
+        add(0x4f2cbd, (const BYTE[]){ 0x8b, 0x07, 0x8b, 0xcf, 0xff, 0x50, 0x4c }, r, 7,
+            "materials generator: game dimmed behind it");
+    }
 }
 
 /*
@@ -388,8 +574,11 @@ static void build_patches(DWORD w, DWORD h)
  *     largest and 640x480 (movies), then the largest's aspect ratio first,
  *     then larger first; sorted ascending
  *   - res_chosen (from 0x5917d3, the "slider moved" branch): saves the choice
- *     to Zax.CFG ([Options] and [ZaxHiRes]) and shows the game's
- *     restart-required message, like a colour depth change does
+ *     to Zax.CFG [ZaxHiRes] only and shows the game's restart-required
+ *     message, like a colour depth change does. The game's own [Options]
+ *     size is left alone: without ZaxHiRes the game can't set most of these
+ *     modes and would exit, so removing the patch must give back the
+ *     settings it found
  *   - at start a [ZaxHiRes] choice wins over /ScreenWidth /ScreenHeight: the
  *     game's command-line reads (0x590d73, 0x590d81) return it
  */
@@ -404,6 +593,16 @@ static DWORD menu_list[5];          /* the game's string list (0x14 bytes) for t
 static void *res_combo __asm__("zh_res_combo");
 static DWORD start_w, start_h;      /* the resolution this run starts with */
 static char cfg_path[MAX_PATH];
+
+/* 16-bit format of the mode the game runs in: 555 (else 565). */
+static int frame_is_555(void)
+{
+    int i;
+    for (i = 0; i < nmodes; i++)
+        if (modes[i].w == start_w && modes[i].h == start_h)
+            return modes[i].fmt == 0x0f;
+    return 0;
+}
 
 static BYTE *display_obj(void)
 {
@@ -505,10 +704,8 @@ void __attribute__((stdcall)) res_chosen(BYTE *dialog)
     h = menu[idx].h;
     logmsg("Options menu: resolution %lux%lu chosen, applies at the next start", w, h);
     wsprintfA(num, "%lu", w);
-    WritePrivateProfileStringA("Options", "Screen Width", num, cfg_path);
     WritePrivateProfileStringA("ZaxHiRes", "Screen Width", num, cfg_path);
     wsprintfA(num, "%lu", h);
-    WritePrivateProfileStringA("Options", "Screen Height", num, cfg_path);
     WritePrivateProfileStringA("ZaxHiRes", "Screen Height", num, cfg_path);
     msg = ((AllocFn)0x417710)(0x11c);       /* as the colour depth message, 0x59177a */
     if (msg)
@@ -669,11 +866,11 @@ static int menu_resolution(DWORD *w, DWORD *h)
 
 static void add_mov_eax_for_call(DWORD va, DWORD callee, DWORD value, const char *what)
 {
-    BYTE o[5] = { 0xe8 }, r[5] = { 0xb8 };
-    DWORD rel = callee - (va + 5);
-    copy(o + 1, &rel, 4);
+    BYTE o[5], r[5] = { 0xb8 };
+    va = reloc(va);
+    call_bytes(o, va, callee);
     copy(r + 1, &value, 4);
-    add(va, o, r, 5, what);
+    put(va, o, r, 5, what);
 }
 
 static void setup_mode_menu(DWORD w, DWORD h, int from_menu)
@@ -688,12 +885,7 @@ static void setup_mode_menu(DWORD w, DWORD h, int from_menu)
             res_menu_open_hook, "Options menu: resolution drop-down instead of the slider");
     add_jmp(0x5914f5, (const BYTE[]){ 0x8b, 0x8e, 0x70, 0x01, 0x00, 0x00 }, 6,
             res_menu_select_hook, "Options menu: drop-down shows the pending resolution");
-    {
-        BYTE o[5] = { 0xe8 };
-        DWORD rel = 0x407660 - (0x407af8 + 5);
-        copy(o + 1, &rel, 4);
-        add_call(0x407af8, o, popup_fit, "drop-down popups: room for the scroll bar");
-    }
+    add_call(0x407af8, 0x407660, popup_fit, "drop-down popups: room for the scroll bar");
     add(0x59197c, (const BYTE[]){ 0xff, 0x92, 0x34, 0x01, 0x00, 0x00 },
         (const BYTE[]){ 0xff, 0x92, 0x30, 0x01, 0x00, 0x00 }, 6,
         "Options menu: read the drop-down's selection (slider value before)");
@@ -1467,6 +1659,9 @@ static void apply(void)
         center_dx = (w - 800) / 2;
         center_dy = (h - 600) / 2;
         logmsg("menu centring offset: %d,%d", center_dx, center_dy);
+        gen_dx = (w - GEN_W) / 2;
+        gen_dy = h - HUD_OPEN_TOP - GEN_H;
+        logmsg("materials generator offset: %d,%d", gen_dx, gen_dy);
         build_patches(w, h);
 
         /* Zoom: max (zoom-out) limit was 960/W capped at 1.0, i.e. 0.5 at
@@ -1553,15 +1748,20 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     logfile = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     logmsg("ZaxHiRes loaded into %s", exedir);
 
-    /* Only touch the image we were written for. */
+    /* Only touch the images we were written for. */
     {
         BYTE *base = (BYTE *)GetModuleHandleA(NULL);
         IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + ((IMAGE_DOS_HEADER *)base)->e_lfanew);
-        if (base != (BYTE *)0x400000 || nt->FileHeader.TimeDateStamp != ZAX_TIMESTAMP) {
-            logmsg("not Zax.exe build 2001-08-02 (base 0x%08lx, timestamp 0x%08lx), nothing patched",
+        int i;
+        for (i = 0; i < (int)(sizeof builds / sizeof builds[0]); i++)
+            if (nt->FileHeader.TimeDateStamp == builds[i].timestamp)
+                build = &builds[i];
+        if (base != (BYTE *)0x400000 || !build) {
+            logmsg("not a known Zax.exe build (base 0x%08lx, timestamp 0x%08lx), nothing patched",
                    (DWORD)base, nt->FileHeader.TimeDateStamp);
             return TRUE;
         }
+        logmsg("Zax.exe build %s", build->name);
     }
     apply();
     return TRUE;

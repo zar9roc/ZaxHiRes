@@ -2,3 +2,4 @@ build/
 dist/
 *.asi
 *.log
+ref/
